@@ -1,0 +1,140 @@
+# modem.py
+import logging
+import serial
+
+logging.basicConfig(
+    filename="modem.log",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+logger = logging.getLogger("Modem")
+
+
+class Modem:
+    def __init__(self, port: str, baudrate: int = 115200):
+        self.port_name = port
+        self.baudrate = baudrate
+        self._ser = None
+        logger.info(f"Modem object created for port {self.port_name} @ {self.baudrate} baud")
+
+    def open_modem_port(self, timeout=2):
+        self._ser = serial.Serial(
+            port=self.port_name,
+            baudrate=self.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=timeout,
+            write_timeout=timeout
+        )
+        logger.info(f"Opened port {self.port_name}")
+        return self._ser
+
+    def connect_modem(self, timeout=2) -> None:
+        if self._ser is None or not self._ser.is_open:
+            self.open_modem_port(timeout=timeout)
+
+    def close(self) -> None:
+        if self._ser is not None and self._ser.is_open:
+            self._ser.close()
+            logger.info(f"Closed port {self.port_name}")
+        self._ser = None
+
+    def send_at_command(self, command: str):
+        if self._ser is None or not self._ser.is_open:
+            raise RuntimeError("Modem not connected. Call connect_modem() first.")
+
+        if not command.endswith("\r\n"):
+            command += "\r\n"
+
+        clean_cmd = command.strip()
+        logger.debug(f"Sending AT command: {clean_cmd}")
+        self._ser.write(command.encode("ascii"))
+
+        lines = []
+        while True:
+            try:
+                line = self._ser.readline()
+                if not line:
+                    break
+                decoded = line.decode(errors="ignore").strip()
+                logger.debug(f"Received: {decoded}")
+                lines.append(decoded)
+            except Exception as e:
+                print(f"1.Error: {e}")
+        return lines
+
+    def _single_line_response(self, cmd: str, echo: str):
+        resp = self.send_at_command(cmd)
+        for line in resp:
+            if line not in (echo, "OK", ""):
+                return line
+        return None
+
+    def get_manufacturer(self):
+        return self._single_line_response("AT+CGMI", "AT+CGMI")
+
+    def get_model(self):
+        return self._single_line_response("AT+CGMM", "AT+CGMM")
+
+    def get_imei(self):
+        return self._single_line_response("AT+CGSN", "AT+CGSN")
+
+    def get_firmware(self):
+        return self._single_line_response("AT+CGMR", "AT+CGMR")
+
+    def get_signal(self):
+        # returns raw +CSQ: x,y line; we’ll parse later if needed
+        resp = self.send_at_command("AT+CSQ")
+        for line in resp:
+            if line.startswith("+CSQ"):
+                return line
+        return None
+
+def main():
+   # Change COM port to match your setup
+   modem_port = "COM8"
+
+
+   # Create modem object
+   modem = Modem(modem_port)
+
+
+   try:
+       # Connect to modem (opens serial port)
+       modem.connect_modem()
+
+
+       # Send simple test command
+       print("\n--- Manufacturer ---")
+       resp = modem.get_manufacturer()
+       print(resp)
+
+
+       print("\n--- Model ---")
+       resp = modem.get_model()
+       print(resp)
+
+
+   except Exception as e:
+       print(f"Error: {e}")
+
+
+   finally:
+       # Always close port safely
+       modem.close()
+
+
+
+
+if __name__ == "__main__":
+   logger = logging.getLogger("modem")
+   logging.basicConfig(
+       filename="modem.log",  # <-- the log file will be created here
+       level=logging.DEBUG,  # log everything
+       format="%(asctime)s [%(levelname)s] %(message)s"
+   )
+   logging.info("Log file created successfully")
+   main()
+
