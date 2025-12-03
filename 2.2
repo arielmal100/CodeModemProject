@@ -1,0 +1,11 @@
+Check SIM → Enable network → Wait for registration → Verify connection
+
+try:
+       # Connect to modem (opens serial port)
+       modem.connect_modem()
+       commands=['AT+CPIN?','AT+CREG=2','AT+COPS=0','AT+CEREG?']
+       for command in commands:
+            resp=modem.send_at_command(command)
+            print(resp)
+   except Exception as e:
+       print(f"Error: {e}")
