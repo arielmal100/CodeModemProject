@@ -1,0 +1,521 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from serial.tools import list_ports
+
+from src.modem import Modem   # make sure this path is correct
+
+
+class ModemGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Cellular Modem Monitor ")
+
+        self.modem: Modem | None = None  # will hold Modem instance
+
+        # ---------- TOP TITLE ----------
+        title_label = ttk.Label(
+            root,
+            text="Cellular Modem Monitor - Level 2",
+            font=("Arial", 14, "bold")
+        )
+        title_label.grid(row=0, column=0, columnspan=4,
+                         padx=10, pady=(10, 5), sticky="w")
+
+        # ---------- PORT + CONNECT ----------
+        ttk.Label(root, text="Port:").grid(
+            row=1, column=0, padx=(10, 5), pady=5, sticky="w"
+        )
+
+        self.port_var = tk.StringVar()
+        self.port_combo = ttk.Combobox(
+            root, textvariable=self.port_var, width=15, state="readonly"
+        )
+        self.port_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+        self.refresh_button = ttk.Button(
+            root, text="Refresh Ports ", command=self.refresh_ports
+        )
+        self.refresh_button.grid(row=1, column=2, padx=(5, 10), pady=5, sticky="e")
+
+        self.connect_button = ttk.Button(
+            root, text="Connect", command=self.on_connect_pressed
+        )
+        self.connect_button.grid(row=1, column=3, padx=(5, 10), pady=5, sticky="e")
+
+        ttk.Separator(root, orient="horizontal").grid(
+            row=2, column=0, columnspan=4, sticky="ew", padx=10, pady=5
+        )
+
+        # ==========================================================
+        #  MIDDLE AREA – 4 GROUPS IN A 2x2 GRID
+        # ==========================================================
+        info_frame = ttk.Frame(root)
+        info_frame.grid(row=3, column=0, columnspan=4,
+                        padx=10, pady=5, sticky="nsew")
+
+        # allow this frame to expand
+        root.rowconfigure(3, weight=1)
+        for c in range(4):
+            root.columnconfigure(c, weight=1)
+
+        info_frame.columnconfigure(0, weight=1)
+        info_frame.columnconfigure(1, weight=1)
+
+        # ---------- 1) MODEM INFO ----------
+        modem_frame = ttk.LabelFrame(info_frame, text="Modem Info")
+        modem_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+
+        self.manufacturer_var = tk.StringVar(value="")
+        self.model_var = tk.StringVar(value="")
+        self.imei_var = tk.StringVar(value="")
+        self.firmware_var = tk.StringVar(value="")
+
+        ttk.Label(modem_frame, text="Manufacturer:").grid(
+            row=0, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(modem_frame, textvariable=self.manufacturer_var,
+                  relief="sunken", width=30).grid(
+            row=0, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(modem_frame, text="Model:").grid(
+            row=1, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(modem_frame, textvariable=self.model_var,
+                  relief="sunken", width=30).grid(
+            row=1, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(modem_frame, text="IMEI:").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(modem_frame, textvariable=self.imei_var,
+                  relief="sunken", width=30).grid(
+            row=2, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(modem_frame, text="Firmware:").grid(
+            row=3, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(modem_frame, textvariable=self.firmware_var,
+                  relief="sunken", width=30).grid(
+            row=3, column=1, sticky="w", padx=5, pady=2
+        )
+
+        # ---------- 2) SIM INFO ----------
+        sim_frame = ttk.LabelFrame(info_frame, text="SIM Info")
+        sim_frame.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
+
+        self.sim_status_var = tk.StringVar(value="")
+        self.imsi_var = tk.StringVar(value="")
+        self.iccid_var = tk.StringVar(value="")
+        self.msisdn_var = tk.StringVar(value="")  # phone number
+
+        ttk.Label(sim_frame, text="Status:").grid(
+            row=0, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(sim_frame, textvariable=self.sim_status_var,
+                  relief="sunken", width=30).grid(
+            row=0, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(sim_frame, text="IMSI:").grid(
+            row=1, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(sim_frame, textvariable=self.imsi_var,
+                  relief="sunken", width=30).grid(
+            row=1, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(sim_frame, text="ICCID:").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(sim_frame, textvariable=self.iccid_var,
+                  relief="sunken", width=30).grid(
+            row=2, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(sim_frame, text="Phone:").grid(
+            row=3, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(sim_frame, textvariable=self.msisdn_var,
+                  relief="sunken", width=30).grid(
+            row=3, column=1, sticky="w", padx=5, pady=2
+        )
+
+        # ---------- 3) NETWORK INFO ----------
+        net_frame = ttk.LabelFrame(info_frame, text="Network Info")
+        net_frame.grid(row=1, column=0, padx=5, pady=5, sticky="nsew")
+
+        self.net_status_var = tk.StringVar(value="")
+        self.operator_var = tk.StringVar(value="")
+        self.mccmnc_var = tk.StringVar(value="")
+        self.lac_cell_var = tk.StringVar(value="")
+        self.tech_band_var = tk.StringVar(value="")
+
+        ttk.Label(net_frame, text="Status:").grid(
+            row=0, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(net_frame, textvariable=self.net_status_var,
+                  relief="sunken", width=30).grid(
+            row=0, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(net_frame, text="Operator:").grid(
+            row=1, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(net_frame, textvariable=self.operator_var,
+                  relief="sunken", width=30).grid(
+            row=1, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(net_frame, text="MCC/MNC:").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(net_frame, textvariable=self.mccmnc_var,
+                  relief="sunken", width=30).grid(
+            row=2, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(net_frame, text="LAC / Cell ID:").grid(
+            row=3, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(net_frame, textvariable=self.lac_cell_var,
+                  relief="sunken", width=30).grid(
+            row=3, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(net_frame, text="Technology/Band:").grid(
+            row=4, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(net_frame, textvariable=self.tech_band_var,
+                  relief="sunken", width=30).grid(
+            row=4, column=1, sticky="w", padx=5, pady=2
+        )
+
+        # ---------- 4) SIGNAL QUALITY ----------
+        sig_frame = ttk.LabelFrame(info_frame, text="Signal Quality")
+        sig_frame.grid(row=1, column=1, padx=5, pady=5, sticky="nsew")
+
+        self.rssi_var = tk.StringVar(value="")
+        self.rsrp_var = tk.StringVar(value="")
+        self.rsrq_var = tk.StringVar(value="")
+        self.sinr_var = tk.StringVar(value="")
+
+        ttk.Label(sig_frame, text="RSSI:").grid(
+            row=0, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(sig_frame, textvariable=self.rssi_var,
+                  relief="sunken", width=30).grid(
+            row=0, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(sig_frame, text="RSRP:").grid(
+            row=1, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(sig_frame, textvariable=self.rsrp_var,
+                  relief="sunken", width=30).grid(
+            row=1, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(sig_frame, text="RSRQ:").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(sig_frame, textvariable=self.rsrq_var,
+                  relief="sunken", width=30).grid(
+            row=2, column=1, sticky="w", padx=5, pady=2
+        )
+
+        ttk.Label(sig_frame, text="SINR:").grid(
+            row=3, column=0, sticky="w", padx=5, pady=2
+        )
+        ttk.Label(sig_frame, textvariable=self.sinr_var,
+                  relief="sunken", width=30).grid(
+            row=3, column=1, sticky="w", padx=5, pady=2
+        )
+
+        # ==========================================================
+        #  BOTTOM BUTTONS + STATUS BAR
+        # ==========================================================
+        button_frame = ttk.Frame(root)
+        button_frame.grid(row=4, column=0, columnspan=4,
+                          padx=10, pady=(5, 5), sticky="e")
+
+        self.scan_button = ttk.Button(
+            button_frame, text="Scan Operators", command=self.scan_operators
+        )
+        self.scan_button.grid(row=0, column=0, padx=5)
+
+        self.refresh_info_button = ttk.Button(
+            button_frame, text="Refresh", command=self.on_refresh_info
+        )
+        self.refresh_info_button.grid(row=0, column=1, padx=5)
+
+        ttk.Separator(root, orient="horizontal").grid(
+            row=5, column=0, columnspan=4, sticky="ew", padx=10, pady=5
+        )
+
+        self.status_var = tk.StringVar(value="Disconnected")
+        ttk.Label(root, text="Status:").grid(
+            row=6, column=0, padx=10, pady=(0, 10), sticky="w"
+        )
+        ttk.Label(root, textvariable=self.status_var,
+                  width=40, relief="sunken").grid(
+            row=6, column=1, columnspan=3, padx=10, pady=(0, 10), sticky="we"
+        )
+
+        # Initial port scan
+        self.refresh_ports()
+
+    # ---------- Helper methods ----------
+
+    def refresh_ports(self):
+        ports = [p.device for p in list_ports.comports()]
+        self.port_combo["values"] = ports
+        if ports:
+            self.port_combo.current(0)
+        else:
+            self.port_var.set("")
+        self.status_var.set("Ports refreshed")
+
+    def on_connect_pressed(self):
+        if self.modem is None:
+            self.connect_modem()
+        else:
+            self.disconnect_modem()
+
+    def connect_modem(self):
+        port = self.port_var.get()
+        if not port:
+            messagebox.showwarning("No port selected", "Please select a serial port.")
+            return
+
+        try:
+            self.modem = Modem(port)
+            self.modem.connect_modem()
+        except Exception as e:
+            self.modem = None
+            self.status_var.set("Connection failed")
+            messagebox.showerror("Error", f"Failed to connect: {e}")
+            return
+
+        self.status_var.set(f"Connected to {port}")
+        self.connect_button.config(text="Disconnect")
+
+        # Query initial info
+        self.update_modem_info()
+        self.update_sim_info()
+        self.update_network_info()
+        self.update_signal_info()
+
+    def disconnect_modem(self):
+        if self.modem is not None:
+            self.modem.close()
+            self.modem = None
+
+        self.status_var.set("Disconnected")
+        self.connect_button.config(text="Connect")
+
+        # Clear fields
+        self.manufacturer_var.set("")
+        self.model_var.set("")
+        self.imei_var.set("")
+        self.firmware_var.set("")
+
+        self.sim_status_var.set("")
+        self.imsi_var.set("")
+        self.iccid_var.set("")
+        self.msisdn_var.set("")
+
+        self.net_status_var.set("")
+        self.operator_var.set("")
+        self.mccmnc_var.set("")
+        self.lac_cell_var.set("")
+        self.tech_band_var.set("")
+
+        self.rssi_var.set("")
+        self.rsrp_var.set("")
+        self.rsrq_var.set("")
+        self.sinr_var.set("")
+
+    def update_modem_info(self):
+        if self.modem is None:
+            return
+
+        try:
+            manu = self.modem.get_manufacturer()
+            model = self.modem.get_model()
+            imei = self.modem.get_imei()
+            fw = self.modem.get_firmware()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read modem info: {e}")
+            return
+
+        if manu:
+            self.manufacturer_var.set(manu)
+        if model:
+            self.model_var.set(model)
+        if imei:
+            self.imei_var.set(imei)
+        if fw:
+            self.firmware_var.set(fw)
+
+    def update_sim_info(self):
+        if self.modem is None:
+            return
+
+        try:
+            status = self.modem.check_sim_status()
+            imsi = self.modem.get_imsi()
+            iccid = self.modem.get_iccid()
+            msisdn = self.modem.get_msisdn()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read SIM info: {e}")
+            return
+
+        if status:
+            self.sim_status_var.set(status)
+        if imsi:
+            self.imsi_var.set(imsi)
+        if iccid:
+            self.iccid_var.set(iccid)
+        if msisdn:
+            self.msisdn_var.set(msisdn)
+
+    def update_network_info(self):
+        if self.modem is None:
+            return
+
+        try:
+            reg = self.modem.get_registration_status()
+            op = self.modem.get_operator()
+            net = self.modem.get_network()  # <-- NEW: MCC/MNC/PLMN/Cell ID from QENG
+            cpsi = self.modem.get_serving_cell_info()  # you can later replace this with QENG/QNWINFO if you like
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read network info: {e}")
+            return
+
+        # ---- registration status (from +CREG?) ----
+        if reg:
+            stat = reg.get("stat", "")
+            status_text = {
+                "0": "Not registered",
+                "1": "Registered (home)",
+                "2": "Searching",
+                "3": "Registration denied",
+                "4": "Unknown",
+                "5": "Registered (roaming)"
+            }.get(stat, f"stat={stat}")
+            self.net_status_var.set(status_text)
+
+            lac = reg.get("lac")
+            ci = reg.get("ci")
+            if lac or ci:
+                self.lac_cell_var.set(f"LAC={lac}, CI={ci}")
+
+        # ---- operator name (from AT+COPS?) ----
+        if op:
+            self.operator_var.set(op)
+
+        # ---- PLMN / MCC+MNC (from +QENG="servingcell") ----
+        if net:
+            plmn = net.get("plmn")
+            mcc = net.get("mcc")
+            mnc = net.get("mnc")
+
+            if plmn:
+                # Show PLMN, e.g. 42501
+                self.mccmnc_var.set(f"{plmn} (MCC={mcc}, MNC={mnc})")
+            else:
+                # fallback or clear
+                self.mccmnc_var.set("")
+
+        # ---- tech/band info (for now still from CPSI/QENG raw) ----
+        if cpsi:
+            self.tech_band_var.set(cpsi.get("raw", ""))
+
+    def get_lte_metrics(self):
+        """
+        Returns dict with RSRP, RSRQ, RSSI, SINR from Quectel modem.
+        """
+        resp = self.send_at_command('AT+QENG="servingcell"')
+        for line in resp:
+            if "+QENG:" in line:
+                parts = [p.strip() for p in line.split(",")]
+                try:
+                    rsrp = float(parts[-4])
+                    rsrq = float(parts[-3])
+                    rssi = float(parts[-2])
+                    sinr = float(parts[-1])
+                    return {
+                        "rsrp": rsrp,
+                        "rsrq": rsrq,
+                        "rssi": rssi,
+                        "sinr": sinr
+                    }
+                except Exception as e:
+                    print("Parsing error:", e)
+                    return None
+        return None
+
+    def update_signal_info(self):
+        if self.modem is None:
+            return
+
+        try:
+            sig = self.modem.get_lte_metrics()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read signal quality: {e}")
+            return
+
+        if not sig:
+            self.rssi_var.set("N/A")
+            self.rsrp_var.set("N/A")
+            self.rsrq_var.set("N/A")
+            self.sinr_var.set("N/A")
+            return
+
+        # Each value: show "N/A" if None, otherwise append units
+        rssi = sig.get("rssi")
+        rsrp = sig.get("rsrp")
+        rsrq = sig.get("rsrq")
+        sinr = sig.get("sinr")
+
+        self.rssi_var.set("N/A" if rssi is None else f"{rssi} dBm")
+        self.rsrp_var.set("N/A" if rsrp is None else f"{rsrp} dBm")
+        self.rsrq_var.set("N/A" if rsrq is None else f"{rsrq} dB")
+        self.sinr_var.set("N/A" if sinr is None else f"{sinr} dB")
+
+    def on_refresh_info(self):
+        if self.modem is None:
+            messagebox.showwarning("Not connected", "Please connect to a modem first.")
+            return
+
+        self.update_modem_info()
+        self.update_sim_info()
+        self.update_network_info()
+        self.update_signal_info()
+        self.status_var.set("Information refreshed")
+
+    def scan_operators(self):
+        if self.modem is None:
+            messagebox.showwarning("Not connected", "Please connect to a modem first.")
+            return
+
+        try:
+            ops = self.modem.scan_operators()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to scan operators: {e}")
+            return
+
+        if not ops:
+            messagebox.showinfo("Operators", "No operators found (or scan not supported).")
+        else:
+            msg = "Available operators:\n" + "\n".join(f"- {o}" for o in ops)
+            messagebox.showinfo("Operators", msg)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ModemGUI(root)
+    root.mainloop()
