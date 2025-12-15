@@ -1,0 +1,163 @@
+    def disconnect_modem(self):
+        self.manager.disconnect(self.idx)
+        self.modem = None
+
+        self.status_var.set("Disconnected")
+        self.connect_button.config(text="Connect")
+
+        # Clear fields
+        self.manufacturer_var.set("")
+        self.model_var.set("")
+        self.imei_var.set("")
+        self.firmware_var.set("")
+
+        self.sim_status_var.set("")
+        self.imsi_var.set("")
+        self.iccid_var.set("")
+        self.msisdn_var.set("")
+
+        self.net_status_var.set("")
+        self.operator_var.set("")
+        self.mccmnc_var.set("")
+        self.lac_cell_var.set("")
+        self.tech_band_var.set("")
+
+        self.rssi_var.set("")
+        self.rsrp_var.set("")
+        self.rsrq_var.set("")
+        self.sinr_var.set("")
+        self.last_signal = None
+        self.last_network = None
+
+    def update_modem_info(self):
+        if self.modem is None:
+            return
+
+        try:
+            manu = self.modem.get_manufacturer()
+            model = self.modem.get_model()
+            imei = self.modem.get_imei()
+            fw = self.modem.get_firmware()
+        except Exception as e:
+            print("error")
+            return
+
+        if manu:
+            self.manufacturer_var.set(manu)
+        if model:
+            self.model_var.set(model)
+        if imei:
+            self.imei_var.set(imei)
+        if fw:
+            self.firmware_var.set(fw)
+
+    def update_sim_info(self):
+        if self.modem is None:
+            return
+
+        try:
+            status = self.modem.check_sim_status()
+            imsi = self.modem.get_imsi()
+            iccid = self.modem.get_iccid()
+            msisdn = self.modem.get_msisdn()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read SIM info: {e}")
+            return
+
+        if status:
+            self.sim_status_var.set(status)
+        if imsi:
+            self.imsi_var.set(imsi)
+        if iccid:
+            self.iccid_var.set(iccid)
+        if msisdn:
+            self.msisdn_var.set(msisdn)
+
+    def update_network_info(self):
+        if self.modem is None:
+            return
+
+        try:
+            reg = self.modem.get_registration_status()
+            op = self.modem.get_operator()
+            net = self.modem.get_network()
+            cpsi = self.modem.get_serving_cell_info()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read network info: {e}")
+            return
+
+        # store even if it's None, but always check before using
+        self.last_network = net
+
+        # ---- registration status (CREG) ----
+        if reg:
+            stat = reg.get("stat", "")
+            status_text = {
+                "0": "Not registered",
+                "1": "Registered (home)",
+                "2": "Searching",
+                "3": "Registration denied",
+                "4": "Unknown",
+                "5": "Registered (roaming)",
+            }.get(stat, f"stat={stat}")
+            self.net_status_var.set(status_text)
+
+        # ---- operator name ----
+        if op:
+            self.operator_var.set(op)
+
+        # ---- PLMN / cell id from get_network() ----
+        if net is not None:
+            ci = net.get("cell_id")
+            plmn = net.get("plmn")
+            mcc = net.get("mcc")
+            mnc = net.get("mnc")
+
+            if ci:
+                self.lac_cell_var.set(f"CI={ci}")
+            else:
+                self.lac_cell_var.set("")
+
+            if plmn:
+                self.mccmnc_var.set(f"{plmn} (MCC={mcc}, MNC={mnc})")
+            else:
+                self.mccmnc_var.set("")
+        else:
+            # no network info available
+            self.lac_cell_var.set("")
+            self.mccmnc_var.set("")
+
+        # ---- tech/band (still from CPSI/QENG raw) ----
+        if cpsi:
+            self.tech_band_var.set(cpsi.get("raw", ""))
+        else:
+            self.tech_band_var.set("")
+
+    def update_signal_info(self):
+        if self.modem is None:
+            return
+
+        try:
+            sig = self.modem.get_lte_metrics()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read signal quality: {e}")
+            return
+
+        self.last_signal = sig
+
+        if not sig:
+            self.rssi_var.set("N/A")
+            self.rsrp_var.set("N/A")
+            self.rsrq_var.set("N/A")
+            self.sinr_var.set("N/A")
+            return
+
+        rssi = sig.get("rssi")
+        rsrp = sig.get("rsrp")
+        rsrq = sig.get("rsrq")
+        sinr = sig.get("sinr")
+
+        self.rssi_var.set("N/A" if rssi is None else f"{rssi} dBm")
+        self.rsrp_var.set("N/A" if rsrp is None else f"{rsrp} dBm")
+        self.rsrq_var.set("N/A" if rsrq is None else f"{rsrq} dB")
+        self.sinr_var.set("N/A" if sinr is None else f"{sinr} dB")
