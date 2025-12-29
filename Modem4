@@ -1,0 +1,383 @@
+import json
+import logging
+import serial
+import time
+import re
+import threading
+
+logger = logging.getLogger("Modem")
+
+
+class Modem:
+    def __init__(self, port: str, baudrate: int = 115200, profile_path: str | None = None):
+        self.port_name = port
+        self.baudrate = baudrate
+        self._ser = None
+        self.profile = {}
+
+        if profile_path is not None:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                self.profile = json.load(f)
+
+        logger.info(
+            f"Modem object created for port {self.port_name} @ {self.baudrate} baud "
+            f"with profile '{self.profile.get('name', 'NO PROFILE')}'"
+        )
+
+    # ---------- PROFILE HELPER ----------
+
+    def _send_and_split(self, cmd_cfg_key: str):
+        """
+        Look up a command config in the profile, send it,
+        return (parts, cfg) for the first matching line.
+        """
+        if not self.profile:
+            return None, None
+
+        cfg = self.profile.get("commands", {}).get(cmd_cfg_key)
+        if not cfg:
+            return None, None
+
+        cmd = cfg["cmd"]
+        prefix = cfg.get("prefix", "")
+        sep = cfg.get("split", ",")
+        strip_quotes = cfg.get("strip_quotes", True)
+
+        resp = self.send_at_command(cmd)
+        for line in resp:
+            if prefix in line:
+                raw = line.split(":", 1)[-1] if ":" in line and prefix in line else line
+                raw = raw.strip()
+                parts = [p.strip() for p in raw.split(sep)]
+                if strip_quotes:
+                    parts = [p.strip().strip('"') for p in parts]
+                return parts, cfg
+
+        return None, cfg
+
+    # ---------- SERIAL PORT ----------
+
+    def open_modem_port(self, timeout=2):
+        self._ser = serial.Serial(
+            port=self.port_name,
+            baudrate=self.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=timeout,
+            write_timeout=timeout
+        )
+        logger.info(f"Opened port {self.port_name}")
+        return self._ser
+
+    def connect_modem(self, timeout=2) -> None:
+        if self._ser is None or not self._ser.is_open:
+            self.open_modem_port(timeout=timeout)
+
+    def close(self) -> None:
+        if self._ser is not None and self._ser.is_open:
+            self._ser.close()
+            logger.info(f"Closed port {self.port_name}")
+        self._ser = None
+
+    # ---------- CORE AT SEND ----------
+
+    def send_at_command(self, command: str):
+        """
+        Send AT command and return list of decoded response lines (stripped).
+        """
+        if self._ser is None or not self._ser.is_open:
+            raise RuntimeError("Modem not connected. Call connect_modem() first.")
+
+        if not command.endswith("\r\n"):
+            command += "\r\n"
+
+        clean_cmd = command.strip()
+        logger.debug(f"Sending AT command: {clean_cmd}")
+        self._ser.write(command.encode("ascii"))
+
+        resp = self._ser.readlines()
+        lines = [line.decode(errors="ignore").strip() for line in resp]
+        logger.debug(f"Response to {clean_cmd}: {lines}")
+        return lines
+
+    def _single_line_response(self, cmd: str, echo: str):
+        resp = self.send_at_command(cmd)
+        for line in resp:
+            if line not in (echo, "OK", ""):
+                return line
+        return None
+
+    # ---------- BASIC INFO ----------
+
+    def get_manufacturer(self):
+        return self._single_line_response("AT+CGMI", "AT+CGMI")
+
+    def get_model(self):
+        return self._single_line_response("AT+CGMM", "AT+CGMM")
+
+    def get_imei(self):
+        return self._single_line_response("AT+CGSN", "AT+CGSN")
+
+    def get_firmware(self):
+        return self._single_line_response("AT+CGMR", "AT+CGMR")
+
+    # ---------- SIGNAL ----------
+
+    def get_signal_raw(self):
+        resp = self.send_at_command("AT+CSQ")
+        for line in resp:
+            if line.startswith("+CSQ"):
+                return line
+        return None
+
+    def get_signal_quality(self):
+        resp = self.send_at_command("AT+CSQ")
+        for line in resp:
+            if "+CSQ:" in line:
+                try:
+                    values = line.split(":")[1].strip()
+                    rssi_str, ber_str = values.split(",")
+                    rssi_str = rssi_str.strip()
+                    ber_str = ber_str.strip()
+
+                    rssi_val = int(rssi_str) if rssi_str.isdigit() else None
+                    rssi_dbm = -113 + 2 * rssi_val if rssi_val is not None and 0 <= rssi_val <= 31 else None
+
+                    return {
+                        "rssi_raw": rssi_val,
+                        "rssi_dbm": rssi_dbm,
+                        "ber": ber_str
+                    }
+                except Exception as e:
+                    logger.error(f"Failed to parse CSQ line '{line}': {e}")
+                    return None
+        return None
+
+    # ---------- SIM ----------
+
+    def check_sim_status(self):
+        resp = self.send_at_command("AT+CPIN?")
+        for line in resp:
+            if "+CPIN:" in line:
+                return line.split(":")[1].strip()
+        return None
+
+    def enter_pin(self, pin: str):
+        resp = self.send_at_command(f"AT+CPIN={pin}")
+        return any("OK" in line for line in resp)
+
+    def get_imsi(self):
+        resp = self.send_at_command("AT+CIMI")
+        for line in resp:
+            if line.isdigit():
+                return line.strip()
+        return None
+
+    def get_iccid(self):
+        resp = self.send_at_command("AT+CCID")
+        for line in resp:
+            if "+CCID:" in line:
+                return line.split(":")[1].strip()
+        return None
+
+    def get_msisdn(self):
+        resp = self.send_at_command("AT+CNUM")
+        for line in resp:
+            if "+CNUM:" in line:
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    return parts[1].replace('"', "").strip()
+        return None
+
+    # ---------- NETWORK ----------
+
+    def wait_for_registration(self, timeout=30):
+        start = time.time()
+        while time.time() - start < timeout:
+            resp = self.send_at_command("AT+CREG?")
+            for line in resp:
+                if "+CREG:" in line:
+                    parts = line.split(":")[1].split(",")
+                    if len(parts) >= 2:
+                        stat = parts[1].strip()
+                        if stat in ["1", "5"]:
+                            return True
+            time.sleep(1)
+        return False
+
+    def get_registration_status(self):
+        resp = self.send_at_command("AT+CREG?")
+        for line in resp:
+            if "+CREG:" in line:
+                try:
+                    header, data = line.split(":")
+                    parts = [p.strip() for p in data.split(",")]
+                    result = {"raw": line}
+                    if len(parts) >= 2:
+                        result["n"] = parts[0]
+                        result["stat"] = parts[1]
+                    if len(parts) >= 4:
+                        result["lac"] = parts[2]
+                        result["ci"] = parts[3]
+                    return result
+                except Exception as e:
+                    logger.error(f"Failed to parse CREG line '{line}': {e}")
+                    return {"raw": line}
+        return None
+
+    def get_operator(self):
+        resp = self.send_at_command("AT+COPS?")
+        for line in resp:
+            if "+COPS:" in line:
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    op = parts[2].replace('"', "").strip()
+                    return op
+        return None
+
+    def get_serving_cell_info(self):
+        resp = self.send_at_command("AT+CPSI?")
+        for line in resp:
+            if "+CPSI:" in line:
+                return {"raw": line}
+        return None
+
+    # ---------- PROFILE-DRIVEN METHODS ----------
+
+    def get_lte_metrics(self):
+        """
+        Returns dict with fields defined in profile['commands']['lte_metrics']['fields']
+        (e.g. rsrp, rsrq, rssi, sinr), or None if profile/command not defined.
+        """
+        parts, cfg = self._send_and_split("lte_metrics")
+        if not parts or not cfg:
+            return None
+
+        fields = cfg.get("fields", {})
+        out = {}
+
+        n = len(parts)
+
+        def get_part(idx: int):
+            # allow negative indices in JSON
+            real_idx = idx if idx >= 0 else n + idx
+            if 0 <= real_idx < n:
+                return parts[real_idx]
+            return None
+
+        for key, idx in fields.items():
+            if idx is None:
+                out[key] = None
+            else:
+                out[key] = get_part(idx)
+
+        return out
+
+    def get_network(self):
+        """
+        Returns dict with MCC, MNC, PLMN, Cell ID, LAC using profile['commands']['network'].
+        """
+        parts, cfg = self._send_and_split("network")
+        if parts is None or cfg is None:
+            return None
+
+        result: dict[str, str | None] = {
+            "mcc": None,
+            "mnc": None,
+            "plmn": None,
+            "cell_id": None,
+            "lac": None
+        }
+
+        field_idx = cfg.get("fields", {})
+        n = len(parts)
+
+        def get_part(idx: int):
+            real_idx = idx if idx >= 0 else n + idx
+            if 0 <= real_idx < n:
+                return parts[real_idx]
+            return None
+
+        raw_plmn = None
+        for name, idx in field_idx.items():
+            val = get_part(idx)
+            if name == "plmn":
+                raw_plmn = val
+            else:
+                result[name] = val
+
+        plmn_split = cfg.get("plmn_split")
+        if raw_plmn:
+            if plmn_split and plmn_split in raw_plmn:
+                mcc, mnc = raw_plmn.split(plmn_split, 1)
+            else:
+                mcc, mnc = raw_plmn[:3], raw_plmn[3:]
+            result["mcc"] = result.get("mcc") or mcc
+            result["mnc"] = result.get("mnc") or mnc
+            result["plmn"] = f"{mcc}{mnc}"
+        else:
+            mcc = result.get("mcc")
+            mnc = result.get("mnc")
+            if mcc and mnc:
+                result["plmn"] = f"{mcc}{mnc}"
+
+        return result
+
+    def scan_operators(self):
+        resp = self.send_at_command("AT+COPS=?")
+        operators = []
+        for line in resp:
+            if "+COPS:" in line:
+                matches = re.findall(r'\((\d+),"([^"]+)"', line)
+                for _, name in matches:
+                    operators.append(name)
+        return operators
+
+def apn_for_operator(op: str) -> str:
+    op = (op or "").lower()
+    if "cellcom" in op:
+        return "internet.cellular"
+    if "partner" in op or "orange" in op or "pelephone" in op:
+        return "internet"
+    # fallback: most Israeli consumer SIMs use "internet"
+    return "internet"
+def main():
+    modem_port = "COM8"   # change if needed
+
+    # IMPORTANT: pass profile_path
+    modem = Modem(modem_port, profile_path="../profiles/simcom_7070.json")
+
+    try:
+        modem.connect_modem()
+
+        modem.connect_modem()
+        resp = modem.send_at_command('AT+CGDCONT=1,"IP","gg"')
+        print(resp)
+        resp = modem.send_at_command("AT+CNUM")
+        print(resp)
+        resp = modem.send_at_command("AT+CGPADDR=1")
+        print(resp)
+        resp = modem.send_at_command("AT+CGACT=0,1")
+        print(resp)
+
+        resp = modem.send_at_command('AT+CGDCONT=4,"IP","gg"')
+        print(resp)
+        resp = modem.send_at_command("AT+CNUM")
+        print(resp)
+        resp = modem.send_at_command("AT+CGPADDR=4")
+        print(resp)
+        resp = modem.send_at_command("AT+CGACT=0,4")
+        print(resp)
+
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        modem.close()
+
+        print("Port closed.")
+
+
+
+if __name__ == "__main__":
+    main()
