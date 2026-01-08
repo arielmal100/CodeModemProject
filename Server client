@@ -1,0 +1,330 @@
+import json
+import logging
+import serial
+import time
+import re
+import threading
+
+logger = logging.getLogger("Modem")
+logging.basicConfig(level=logging.INFO)
+
+
+# -------------------- SERVER WORKER (URC + multi-client) --------------------
+
+class SimcomServerWorker(threading.Thread):
+    """
+    Minimal SIMCom TCP server worker:
+    - Reads URCs in a thread
+    - Tracks active connections by cid
+    - On +CAOPEN: cid,0 -> registers client
+    - On +CARECV: cid,len -> AT+CARECV then echoes back
+    - Closes idle connections after timeout
+    """
+    def __init__(self, modem, idle_timeout_s=30, recv_max=1500):
+        super().__init__(daemon=True)
+        self.modem = modem
+        self.idle_timeout_s = idle_timeout_s
+        self.recv_max = recv_max
+
+        self.active = {}  # cid -> last_rx_time
+        self.stop_evt = threading.Event()
+
+    def stop(self):
+        self.stop_evt.set()
+
+    def run(self):
+        logger.info("Server worker started (URC reader running).")
+        while not self.stop_evt.is_set():
+            # 1) read a single line (URC or nothing)
+            line = self.modem.read_line(timeout=1.0)
+            if line and line.startswith("+"):
+                print("URC:", line)
+
+                if line.startswith("+CAOPEN:"):
+                    # +CAOPEN: <cid>,<result>
+                    cid, result = self._parse_ints(line)[:2]
+                    if result == 0:
+                        self.active[cid] = time.time()
+                        print(f"Client connected cid={cid}")
+                        self._send_text(cid, "HELLO\r\n")
+
+                elif line.startswith("+CARECV:") or line.startswith("+CADATAIND:"):
+                    # data available; always try to read
+                    cid = self._parse_ints(line)[0]
+                    self._recv_and_echo(cid)
+
+                elif line.startswith("+CACLOSE:"):
+                    cid = self._parse_ints(line)[0]
+                    self.active.pop(cid, None)
+                    print(f"Client closed cid={cid}")
+
+            # 2) timeout handling
+            now = time.time()
+            for cid, last in list(self.active.items()):
+                if now - last > self.idle_timeout_s:
+                    print(f"Timeout cid={cid} -> closing")
+                    self.modem.send_at_command(f"AT+CACLOSE={cid}")
+                    self.active.pop(cid, None)
+
+        logger.info("Server worker stopped.")
+
+    def _recv_and_echo(self, cid: int):
+        resp = self.modem.send_at_command(f"AT+CARECV={cid},{self.recv_max}")
+        msg = self._extract_payload_from_carecv(resp)
+        self.active[cid] = time.time()
+        print(f"RX cid={cid}:", repr(msg))
+
+        # basic echo back
+        self._send_text(cid, f"ECHO: {msg}\r\n")
+
+    def _send_text(self, cid: int, text: str):
+        data = text.encode("utf-8", errors="replace")
+        self.modem.send_at_command(f"AT+CASEND={cid},{len(data)}")
+        self.modem.write_raw(data)
+
+    @staticmethod
+    def _parse_ints(s: str):
+        return [int(x) for x in re.findall(r"-?\d+", s)]
+
+    @staticmethod
+    def _extract_payload_from_carecv(resp_lines):
+        out = []
+        for ln in resp_lines:
+            if ln.startswith("+CARECV:"):
+                continue
+            if ln in ("OK", "ERROR"):
+                continue
+            if ln.strip() == "":
+                continue
+            out.append(ln)
+        return "\n".join(out)
+
+
+# ----------------------------- MODEM CLASS ---------------------------------
+
+class Modem:
+    def __init__(self, port: str, baudrate: int = 115200, profile_path: str | None = None):
+        self.port_name = port
+        self.baudrate = baudrate
+        self._ser = None
+        self.profile = {}
+
+        # IMPORTANT: protect serial from concurrent access (URC thread + send_at_command)
+        self._io_lock = threading.Lock()
+
+        if profile_path is not None:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                self.profile = json.load(f)
+
+        logger.info(
+            f"Modem object created for port {self.port_name} @ {self.baudrate} baud "
+            f"with profile '{self.profile.get('name', 'NO PROFILE')}'"
+        )
+
+    @property
+    def ser(self):
+        if self._ser is None or not self._ser.is_open:
+            raise RuntimeError("Serial not open. Call connect_modem() first.")
+        return self._ser
+
+    # ---------- SERIAL PORT ----------
+
+    def open_modem_port(self, timeout=2):
+        self._ser = serial.Serial(
+            port=self.port_name,
+            baudrate=self.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=timeout,
+            write_timeout=timeout
+        )
+        logger.info(f"Opened port {self.port_name}")
+        return self._ser
+
+    def connect_modem(self, timeout=2) -> None:
+        if self._ser is None or not self._ser.is_open:
+            self.open_modem_port(timeout=timeout)
+
+    def close(self) -> None:
+        if self._ser is not None and self._ser.is_open:
+            self._ser.close()
+            logger.info(f"Closed port {self.port_name}")
+        self._ser = None
+
+    # ---------- CORE AT SEND ----------
+
+    def send_at_command(self, command: str):
+        """
+        Send AT command and return list of decoded response lines (stripped).
+        Thread-safe via self._io_lock so it won't collide with URC reading.
+        """
+        if self._ser is None or not self._ser.is_open:
+            raise RuntimeError("Modem not connected. Call connect_modem() first.")
+
+        if not command.endswith("\r\n"):
+            command += "\r\n"
+
+        clean_cmd = command.strip()
+        logger.debug(f"Sending AT command: {clean_cmd}")
+
+        with self._io_lock:
+            self._ser.write(command.encode("ascii"))
+            resp = self._ser.readlines()
+
+        lines = [line.decode(errors="ignore").strip() for line in resp]
+        logger.debug(f"Response to {clean_cmd}: {lines}")
+        return lines
+
+    # ---------- RAW SERIAL HELPERS (for CASEND payload + URC line reading) ----------
+
+    def write_raw(self, data: bytes):
+        """Write raw bytes (used after AT+CASEND=...)."""
+        with self._io_lock:
+            self.ser.write(data)
+            self.ser.flush()
+
+    def read_line(self, timeout=1.0) -> str:
+        """Read one line from serial (URCs)."""
+        with self._io_lock:
+            old_timeout = self.ser.timeout
+            self.ser.timeout = timeout
+            try:
+                b = self.ser.readline()
+            finally:
+                self.ser.timeout = old_timeout
+
+        if not b:
+            return ""
+        return b.decode("utf-8", errors="replace").strip()
+
+def _extract_ip_from_cgpaddr(resp_lines: list[str]) -> str | None:
+    """
+    Tries to parse an IP from +CGPADDR response.
+    Expected line examples:
+      +CGPADDR: 1,10.12.34.56
+      +CGPADDR: 1,"10.12.34.56"
+    """
+    for line in resp_lines:
+        if "+CGPADDR:" in line:
+            # grab something that looks like an IPv4
+            m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            if m:
+                return m.group(1)
+    return None
+
+
+# ------------------------------- MAIN --------------------------------------
+
+import time
+import re
+
+
+def _extract_ip_from_cgpaddr(resp_lines: list[str]) -> str | None:
+    for line in resp_lines:
+        if "+CGPADDR:" in line:
+            m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def main():
+    modem = Modem("COM8", profile_path="../profiles/simcom_7070.json")           # SIMCom server
+    modem_client = Modem("COM48", profile_path="../profiles/quectel_ec25.json")  # Quectel EC25 client
+
+    server_worker = None
+
+    try:
+        modem.connect_modem()
+        modem_client.connect_modem()
+
+        # ---------------- SIMCOM (SERVER) ----------------
+        print(modem.send_at_command("AT+CMEE=2"))
+
+        print(modem.send_at_command('AT+CGDCONT=1,"IP","gg"'))
+        print(modem.send_at_command("AT+CGATT=1"))
+        print(modem.send_at_command("AT+CGATT?"))
+        print(modem.send_at_command("AT+CGACT=1,1"))
+        print(modem.send_at_command("AT+CGACT?"))
+
+        srv_cgpaddr = modem.send_at_command("AT+CGPADDR=1")
+        print(srv_cgpaddr)
+        server_ip = _extract_ip_from_cgpaddr(srv_cgpaddr)
+        print("SIMCom server IP:", server_ip)
+
+        # Start TCP server on port 8080
+        print(modem.send_at_command('AT+CASERVER=1,1,"TCP",8080'))
+        print(modem.send_at_command("AT+CASERVER?"))
+
+        # Start worker that handles URCs + clients
+        server_worker = SimcomServerWorker(modem, idle_timeout_s=30)
+        server_worker.start()
+
+        print("Server is running. Press Ctrl+C to stop.")
+
+        # ---------------- QUECTEL (CLIENT) ----------------
+        print(modem_client.send_at_command("AT+CMEE=2"))
+
+        # 3GPP context + attach + activate
+        print(modem_client.send_at_command('AT+CGDCONT=1,"IP","gg"'))
+        print(modem_client.send_at_command("AT+CGATT=1"))
+        print(modem_client.send_at_command("AT+CGATT?"))
+        print(modem_client.send_at_command("AT+CGACT=1,1"))
+
+        cli_cgpaddr = modem_client.send_at_command("AT+CGPADDR=1")
+        print(cli_cgpaddr)
+        client_ip = _extract_ip_from_cgpaddr(cli_cgpaddr)
+        print("EC25 IP:", client_ip)
+
+
+        while True:
+            if input().strip().lower() == "q":
+                break
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+    finally:
+        # Stop worker first
+        if server_worker is not None:
+            server_worker.stop()
+            server_worker.join(timeout=2)
+
+        # Close Quectel client connection + contexts
+        try:
+            print(modem_client.send_at_command("AT+QICLOSE=0"))
+            print(modem_client.send_at_command("AT+QIDEACT=1"))
+            print(modem_client.send_at_command("AT+CGACT=0,1"))
+        except Exception:
+            pass
+
+        # Stop SIMCom server CID
+        try:
+            print(modem.send_at_command("AT+CACLOSE=1"))
+            print(modem.send_at_command("AT+CASERVER?"))
+            # KEEPING YOUR ORIGINAL CNACT DEACTIVATE FORM:
+            print(modem.send_at_command("AT+CNACT=1,0"))
+            print(modem.send_at_command("AT+CNACT?"))
+        except Exception:
+            pass
+
+        try:
+            modem_client.close()
+        except Exception:
+            pass
+
+        try:
+            modem.close()
+        except Exception:
+            pass
+
+        print("Ports closed.")
+
+print("Port closed.")
+
+if __name__ == "__main__":
+    main()
